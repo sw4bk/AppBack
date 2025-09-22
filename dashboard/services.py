@@ -32,6 +32,7 @@ class ImageValidator:
     def validate_image(self, file_content: bytes, platform: str, asset_key: str) -> Dict[str, Any]:
         """
         Valida una imagen según las especificaciones de la plataforma.
+        RECHAZA AUTOMÁTICAMENTE archivos que no cumplan con las especificaciones.
         
         Args:
             file_content: Contenido del archivo en bytes
@@ -42,7 +43,7 @@ class ImageValidator:
             Dict con información de validación y metadatos
             
         Raises:
-            ImageValidationError: Si la validación falla
+            ImageValidationError: Si la validación falla (RECHAZO AUTOMÁTICO)
         """
         try:
             # Obtener especificaciones de la plataforma
@@ -56,7 +57,8 @@ class ImageValidator:
             
             if file_format not in specs.get('formats', []):
                 raise ImageValidationError(
-                    f"Formato {file_format} no permitido. Formatos permitidos: {specs['formats']}"
+                    f"❌ RECHAZADO: Formato {file_format} no permitido. "
+                    f"Formatos permitidos: {', '.join(specs['formats'])}"
                 )
             
             # Validar tamaño de archivo
@@ -65,7 +67,7 @@ class ImageValidator:
             
             if file_size > max_size_bytes:
                 raise ImageValidationError(
-                    f"Archivo demasiado grande: {file_size / (1024*1024):.2f}MB. "
+                    f"❌ RECHAZADO: Archivo demasiado grande: {file_size / (1024*1024):.2f}MB. "
                     f"Tamaño máximo permitido: {specs['max_size_mb']}MB"
                 )
             
@@ -80,7 +82,7 @@ class ImageValidator:
             logger.error(f"Error validando imagen: {str(e)}")
             if isinstance(e, ImageValidationError):
                 raise
-            raise ImageValidationError(f"Error interno validando imagen: {str(e)}")
+            raise ImageValidationError(f"❌ RECHAZADO: Error interno validando imagen: {str(e)}")
     
     def _get_platform_specs(self, platform: str, asset_key: str) -> Optional[Dict]:
         """Obtiene las especificaciones de la plataforma desde la base de datos o constantes."""
@@ -120,32 +122,70 @@ class ImageValidator:
         return mime_to_format.get(mime_type, 'UNKNOWN')
     
     def _validate_svg(self, file_content: bytes, specs: Dict, mime_type: str, file_size: int) -> Dict:
-        """Valida archivos SVG."""
-        # Para SVG, validaciones básicas de contenido
-        svg_content = file_content.decode('utf-8', errors='ignore')
-        
-        # Verificar que es un SVG válido
-        if not ('<svg' in svg_content.lower() and '</svg>' in svg_content.lower()):
-            raise ImageValidationError("Archivo SVG inválido")
-        
-        # Verificar transparencia si es requerida
-        has_transparency = 'transparent' in svg_content.lower() or 'rgba' in svg_content.lower()
-        if specs.get('transparent_bg', False) and not has_transparency:
-            raise ImageValidationError("Se requiere transparencia para este asset")
-        
-        return {
-            'valid': True,
-            'format': 'SVG',
-            'mime_type': mime_type,
-            'file_size': file_size,
-            'width': None,  # SVG no tiene dimensiones fijas
-            'height': None,
-            'has_transparency': has_transparency,
-            'warnings': []
-        }
+        """Valida archivos SVG con validaciones estrictas."""
+        try:
+            # Para SVG, validaciones básicas de contenido
+            svg_content = file_content.decode('utf-8', errors='ignore')
+            
+            # Verificar que es un SVG válido
+            if not ('<svg' in svg_content.lower() and '</svg>' in svg_content.lower()):
+                raise ImageValidationError("❌ RECHAZADO: Archivo SVG inválido o corrupto")
+            
+            # Verificar que tenga atributos de viewBox o dimensiones
+            if 'viewbox' not in svg_content.lower() and 'width' not in svg_content.lower():
+                raise ImageValidationError(
+                    "❌ RECHAZADO: SVG debe tener viewBox o dimensiones definidas"
+                )
+            
+            # Verificar transparencia si es requerida
+            has_transparency = (
+                'transparent' in svg_content.lower() or 
+                'rgba' in svg_content.lower() or
+                'fill="none"' in svg_content.lower() or
+                'fill:none' in svg_content.lower()
+            )
+            
+            if specs.get('transparent_bg', False) and not has_transparency:
+                raise ImageValidationError(
+                    "❌ RECHAZADO: Se requiere transparencia para este asset SVG. "
+                    "Use fill='none' o colores RGBA con transparencia."
+                )
+            
+            # Verificar que no tenga transparencia si no se requiere
+            if not specs.get('transparent_bg', False) and has_transparency:
+                raise ImageValidationError(
+                    "❌ RECHAZADO: Este asset SVG no debe tener transparencia. "
+                    "Use un fondo sólido en lugar de transparencia."
+                )
+            
+            # Verificar que no tenga elementos problemáticos
+            problematic_elements = ['<script', '<iframe', '<object', '<embed']
+            for element in problematic_elements:
+                if element in svg_content.lower():
+                    raise ImageValidationError(
+                        f"❌ RECHAZADO: SVG contiene elemento no permitido: {element}"
+                    )
+            
+            return {
+                'valid': True,
+                'format': 'SVG',
+                'mime_type': mime_type,
+                'file_size': file_size,
+                'width': None,  # SVG no tiene dimensiones fijas
+                'height': None,
+                'has_transparency': has_transparency,
+                'warnings': []
+            }
+            
+        except UnicodeDecodeError:
+            raise ImageValidationError("❌ RECHAZADO: Archivo SVG no es texto válido UTF-8")
+        except Exception as e:
+            if isinstance(e, ImageValidationError):
+                raise
+            raise ImageValidationError(f"❌ RECHAZADO: Error validando SVG: {str(e)}")
     
     def _validate_raster_image(self, file_content: bytes, specs: Dict, mime_type: str, file_size: int) -> Dict:
-        """Valida imágenes raster (PNG, JPG)."""
+        """Valida imágenes raster (PNG, JPG) con validaciones estrictas."""
         try:
             # Abrir imagen con Pillow
             image = Image.open(io.BytesIO(file_content))
@@ -153,33 +193,50 @@ class ImageValidator:
             # Obtener dimensiones
             width, height = image.size
             
-            # Validar dimensiones exactas
+            # Validar dimensiones exactas (RECHAZO AUTOMÁTICO si no coinciden)
             expected_width = specs.get('width')
             expected_height = specs.get('height')
             
             if expected_width and width != expected_width:
                 raise ImageValidationError(
-                    f"Ancho incorrecto: {width}px. Se requiere: {expected_width}px"
+                    f"❌ RECHAZADO: Ancho incorrecto: {width}px. Se requiere exactamente: {expected_width}px"
                 )
             
             if expected_height and height != expected_height:
                 raise ImageValidationError(
-                    f"Alto incorrecto: {height}px. Se requiere: {expected_height}px"
+                    f"❌ RECHAZADO: Alto incorrecto: {height}px. Se requiere exactamente: {expected_height}px"
                 )
             
-            # Validar transparencia
+            # Validar transparencia (RECHAZO AUTOMÁTICO si no cumple)
             has_transparency = self._check_transparency(image)
             if specs.get('transparent_bg', False) and not has_transparency:
-                raise ImageValidationError("Se requiere transparencia para este asset")
+                raise ImageValidationError(
+                    "❌ RECHAZADO: Se requiere transparencia para este asset. "
+                    "El archivo debe tener canal alfa (RGBA o LA)."
+                )
             
-            # Generar warnings para margin_recommended_px
+            # Validar que no tenga transparencia si no se requiere
+            if not specs.get('transparent_bg', False) and has_transparency:
+                raise ImageValidationError(
+                    "❌ RECHAZADO: Este asset no debe tener transparencia. "
+                    "Use un fondo sólido en lugar de canal alfa."
+                )
+            
+            # Validar integridad del archivo
+            try:
+                # Intentar procesar la imagen para verificar que no esté corrupta
+                image.verify()
+            except Exception:
+                raise ImageValidationError("❌ RECHAZADO: Archivo de imagen corrupto o inválido")
+            
+            # Generar warnings para margin_recommended_px (solo informativos)
             warnings = []
             margin_px = specs.get('margin_recommended_px')
             if margin_px:
                 effective_width = width - (margin_px * 2)
                 effective_height = height - (margin_px * 2)
                 warnings.append(
-                    f"Recomendado: margen de {margin_px}px. "
+                    f"ℹ️ Recomendado: margen de {margin_px}px. "
                     f"Área efectiva: {effective_width}x{effective_height}px"
                 )
             
@@ -195,7 +252,9 @@ class ImageValidator:
             }
             
         except Exception as e:
-            raise ImageValidationError(f"Error procesando imagen: {str(e)}")
+            if isinstance(e, ImageValidationError):
+                raise
+            raise ImageValidationError(f"❌ RECHAZADO: Error procesando imagen: {str(e)}")
     
     def _check_transparency(self, image: Image.Image) -> bool:
         """Verifica si la imagen tiene transparencia."""
@@ -399,6 +458,7 @@ class MaterialService:
                        file_content: bytes, file_name: str, uploaded_by, request=None) -> Material:
         """
         Crea un nuevo material validando el archivo.
+        RECHAZA AUTOMÁTICAMENTE archivos que no cumplan con las especificaciones.
         
         Args:
             project: Proyecto al que pertenece
@@ -410,9 +470,12 @@ class MaterialService:
             request: Request HTTP (opcional)
             
         Returns:
-            Instancia del material creado
+            Instancia del material creado (solo si pasa validación)
+            
+        Raises:
+            ImageValidationError: Si el archivo no cumple con las especificaciones
         """
-        # Validar imagen
+        # Validar imagen (RECHAZO AUTOMÁTICO si no cumple)
         validation_result = self.image_validator.validate_image(file_content, platform, asset_key)
         
         # Calcular hash
@@ -421,7 +484,7 @@ class MaterialService:
         # Determinar tipo de material
         material_type = 'image' if validation_result['format'] in ['PNG', 'JPG', 'SVG'] else 'document'
         
-        # Crear material
+        # Crear material (solo si pasa todas las validaciones)
         material = Material.objects.create(
             project=project,
             material_type=material_type,
@@ -435,7 +498,7 @@ class MaterialService:
             height=validation_result.get('height'),
             has_transparency=validation_result.get('has_transparency', False),
             uploaded_by=uploaded_by,
-            status='pending'
+            status='pending'  # Solo llega aquí si pasó todas las validaciones
         )
         
         # Log de auditoría
@@ -448,7 +511,8 @@ class MaterialService:
                 'platform': platform,
                 'asset_key': asset_key,
                 'file_size': len(file_content),
-                'validation_warnings': validation_result.get('warnings', [])
+                'validation_warnings': validation_result.get('warnings', []),
+                'validation_status': 'passed'
             },
             request=request
         )
